@@ -377,63 +377,67 @@ if __name__ == '__main__':
         else:
             return alpha
 
-    def inference_single_image(img_array, use_full_image_bbox=False):
+    def inference_single_image(img_array, use_full_image_bbox=False, refine_bbox=False):
         """
         处理单张图片（用于批量处理）
         img_array: numpy array格式的图片
         use_full_image_bbox: 是否使用整张图片作为bbox
+        refine_bbox: 是否在第一次预测后用前景自适应框再跑一遍（对齐单张效果）
         """
         if img_array is None:
             return None, None
-        
-        # 如果没有提供prompts，使用整张图片作为bbox
-        if use_full_image_bbox:
-            H, W = img_array.shape[:2]
-            # 创建一个包含整张图片的bbox，稍微缩小一点避免边界问题
-            margin = 10
-            bbox = [[margin, margin, 2, W - margin, H - margin, 3]]
-            click = []
-        else:
-            # 使用默认的bbox（整张图片）
-            H, W = img_array.shape[:2]
-            margin = 10
-            bbox = [[margin, margin, 2, W - margin, H - margin, 3]]
-            click = []
-        
-        prompts = {
-            "image": img_array,
-            "points": bbox + [[click[0], click[1], click[2]] for click in click] if click else bbox
-        }
-        
-        image, click, bbox, ori_H_W, pad_H_W = resize_image_bbox(prompts, args.box_aug)
-        
-        input_data = {
-            'image': torch.from_numpy(image)[None].to(model.device),
-            'bbox': torch.from_numpy(bbox)[None].to(model.device),
-            'click': torch.from_numpy(click)[None].to(model.device),
-        }
 
-        with torch.no_grad():
-            inputs = preprocess_inputs(input_data, device) 
-            images, bbox, gt_alpha, trimap, condition = inputs['images'], inputs['bbox'], inputs['alpha'], inputs['trimap'], inputs['condition']
-            click = inputs['click']
-            
-            if model.backbone_condition:
-                condition_proj = model.condition_embedding(condition) 
-            elif model.backbone_bbox_prompt is not None or model.bbox_prompt_all_block is not None:
-                condition_proj = bbox
-            else:
-                condition_proj = None
+        def _run_with_bbox(bbox_def):
+            prompts = {"image": img_array, "points": bbox_def}
+            image, click, bbox, ori_H_W, pad_H_W = resize_image_bbox(prompts, args.box_aug)
+            input_data = {
+                'image': torch.from_numpy(image)[None].to(model.device),
+                'bbox': torch.from_numpy(bbox)[None].to(model.device),
+                'click': torch.from_numpy(click)[None].to(model.device),
+            }
+            with torch.no_grad():
+                inputs = preprocess_inputs(input_data, device) 
+                images, bbox_t, gt_alpha, trimap_t, condition = inputs['images'], inputs['bbox'], inputs['alpha'], inputs['trimap'], inputs['condition']
+                click_t = inputs['click']
+                
+                if model.backbone_condition:
+                    condition_proj = model.condition_embedding(condition) 
+                elif model.backbone_bbox_prompt is not None or model.bbox_prompt_all_block is not None:
+                    condition_proj = bbox_t
+                else:
+                    condition_proj = None
 
-            prompt = (click, bbox)
+                prompt = (click_t, bbox_t)
 
-            pred = model.forward((images, prompt))
-            pred = F.interpolate(pred, size=img_array.shape[0:2], mode='bilinear', align_corners=False)
-            trimap = torch.clip(torch.argmax(pred, dim=1) * 128, min=0, max=255)[0].cpu().numpy().astype(np.uint8)
+                pred = model.forward((images, prompt))
+                pred = F.interpolate(pred, size=img_array.shape[0:2], mode='bilinear', align_corners=False)
+                trimap_out = torch.clip(torch.argmax(pred, dim=1) * 128, min=0, max=255)[0].cpu().numpy().astype(np.uint8)
 
-            # Apply matting inference to the result
-            alpha = matting_inference(matter, img_array, trimap, device).squeeze()
-        
+                alpha_out = matting_inference(matter, img_array, trimap_out, device).squeeze()
+                return alpha_out, trimap_out
+
+        # 初次使用整图 bbox
+        H, W = img_array.shape[:2]
+        margin = 10
+        bbox_full = [[margin, margin, 2, W - margin, H - margin, 3]]
+        alpha, trimap = _run_with_bbox(bbox_full)
+
+        # 可选的二次精修：根据前景自动收紧 bbox 再跑一遍
+        if refine_bbox and alpha is not None:
+            fg = alpha > 10  # 阈值可调整
+            ys, xs = np.where(fg)
+            if len(xs) > 0 and len(ys) > 0:
+                x1, x2 = xs.min(), xs.max()
+                y1, y2 = ys.min(), ys.max()
+                pad = 5
+                x1 = max(x1 - pad, 0)
+                y1 = max(y1 - pad, 0)
+                x2 = min(x2 + pad, W - 1)
+                y2 = min(y2 + pad, H - 1)
+                bbox_refined = [[x1, y1, 2, x2, y2, 3]]
+                alpha_ref, trimap_ref = _run_with_bbox(bbox_refined)
+                alpha, trimap = alpha_ref, trimap_ref
+
         return alpha, trimap if args.show_trimap else None
 
     def batch_process_images(image_files, progress=gr.Progress()):
@@ -454,29 +458,31 @@ if __name__ == '__main__':
                 try:
                     # 读取图片
                     if isinstance(img_file, str):
-                        img_array = cv2.imread(img_file)
-                        if img_array is None:
-                            continue
-                        img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+                        src_img = Image.open(img_file)
+                        icc_profile = src_img.info.get("icc_profile")
+                        img_array = np.array(src_img.convert("RGB"))
                         img_name = os.path.basename(img_file)
                     else:
                         # Gradio返回的文件对象
-                        img_array = np.array(Image.open(img_file.name))
+                        src_img = Image.open(img_file.name)
+                        icc_profile = src_img.info.get("icc_profile")
+                        img_array = np.array(src_img.convert("RGB"))
                         img_name = os.path.basename(img_file.name)
                     
-                    # 处理图片
-                    alpha, trimap = inference_single_image(img_array, use_full_image_bbox=True)
+                    # 处理图片：批处理直接调用单张逻辑，并启用 refine_bbox
+                    alpha, trimap = inference_single_image(img_array, use_full_image_bbox=True, refine_bbox=True)
                     
                     if alpha is not None:
                         # 保存结果
                         base_name = os.path.splitext(img_name)[0]
                         alpha_path = os.path.join(temp_dir, f"{base_name}_alpha.png")
-                        Image.fromarray(alpha).save(alpha_path)
+                        save_args = {"icc_profile": icc_profile} if icc_profile else {}
+                        Image.fromarray(alpha).save(alpha_path, **save_args)
                         results.append(alpha_path)
                         
                         if trimap is not None and args.show_trimap:
                             trimap_path = os.path.join(temp_dir, f"{base_name}_trimap.png")
-                            Image.fromarray(trimap).save(trimap_path)
+                            Image.fromarray(trimap).save(trimap_path, **save_args)
                 
                 except Exception as e:
                     print(f"处理图片 {img_name} 时出错: {e}")

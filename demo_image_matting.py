@@ -1,13 +1,19 @@
 import argparse
-import gradio as gr
-from gradio_image_prompter import ImagePrompter
-from detectron2.config import LazyConfig, instantiate
-from detectron2.checkpoint import DetectionCheckpointer
+import os
+import time
+import zipfile
+from pathlib import Path
+
 import cv2
+import gradio as gr
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+from PIL import Image
+from detectron2.checkpoint import DetectionCheckpointer
+from detectron2.config import LazyConfig, instantiate
+from gradio_image_prompter import ImagePrompter
 
 
 
@@ -302,6 +308,35 @@ def resize_image_bbox(prompts,box_aug):
     return img, np.array(click), np.array(bbox), (ori_H, ori_W), (1024, 1024)
 
 
+def load_image_as_numpy(path):
+    """
+    从文件路径读取图像，转换为 RGB 格式的 numpy 数组，供 ImagePrompter 使用。
+    """
+    img = Image.open(path).convert("RGB")
+    return np.array(img)
+
+
+def build_gallery_items(image_paths, current_index, processed_indices):
+    """
+    构建批量图片的状态展示：正在处理 / 已处理 / 待处理。
+    返回给 gr.Gallery 使用的 (image, caption) 列表。
+    """
+    items = []
+    processed_set = set(processed_indices or [])
+    for i, p in enumerate(image_paths):
+        if i == current_index and i in processed_set:
+            status = "已处理(当前)"
+        elif i == current_index:
+            status = "正在处理"
+        elif i in processed_set:
+            status = "已处理"
+        else:
+            status = "待处理"
+        caption = f"{status} | {Path(p).name}"
+        items.append((p, caption))
+    return items
+
+
 def parse_args():
 
 
@@ -374,27 +409,214 @@ if __name__ == '__main__':
             return alpha
 
 
+    # -------------------------
+    # 批量图片 + 单张交互式处理 UI
+    # -------------------------
+
+    def init_batch(files):
+        """
+        根据上传的文件列表，初始化批量处理：
+        - 记录所有图片路径
+        - 将第一张图片显示到 ImagePrompter 上
+        """
+        if not files:
+            raise gr.Error("请先选择至少一张图片进行批量处理。", duration=5)
+
+        paths = [f.name for f in files]
+        first_img = load_image_as_numpy(paths[0])
+        # ImagePrompter 需要 {image, points} 结构
+        prompter_value = {"image": first_img, "points": []}
+        gallery_items = build_gallery_items(paths, 0, [])
+        return prompter_value, paths, 0, [], [], gallery_items
+
+    def goto_next_image(image_paths, index, processed_indices):
+        if not image_paths:
+            raise gr.Error("请先在左侧批量导入图片。", duration=5)
+        index = (index + 1) % len(image_paths)
+        img = load_image_as_numpy(image_paths[index])
+        gallery_items = build_gallery_items(image_paths, index, processed_indices)
+        return {"image": img, "points": []}, index, gallery_items
+
+    def goto_prev_image(image_paths, index, processed_indices):
+        if not image_paths:
+            raise gr.Error("请先在左侧批量导入图片。", duration=5)
+        index = (index - 1) % len(image_paths)
+        img = load_image_as_numpy(image_paths[index])
+        gallery_items = build_gallery_items(image_paths, index, processed_indices)
+        return {"image": img, "points": []}, index, gallery_items
+
+    def save_current_alpha(alpha_img, image_paths, index, processed_indices, processed_alpha_paths):
+        """
+        将当前预测的 alpha 图保存为文件，供一键下载。
+        文件名默认沿用原图名，追加 _alpha 后缀。
+        """
+        if alpha_img is None:
+            raise gr.Error("请先点击推理按钮生成结果，再尝试下载。", duration=5)
+
+        # 决定保存文件名
+        if image_paths and 0 <= index < len(image_paths):
+            base = os.path.splitext(os.path.basename(image_paths[index]))[0]
+            filename = f"{base}_alpha.png"
+        else:
+            filename = f"alpha_{int(time.time())}.png"
+
+        save_dir = "outputs"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, filename)
+
+        alpha_img.save(save_path)
+
+        processed_alpha_paths = processed_alpha_paths or []
+        processed_indices = processed_indices or []
+        if index not in processed_indices:
+            processed_indices = processed_indices + [index]
+        processed_alpha_paths = processed_alpha_paths + [save_path]
+        gallery_items = build_gallery_items(image_paths, index, processed_indices)
+
+        return save_path, processed_indices, processed_alpha_paths, gallery_items
+
+    def auto_save_alpha(alpha_img, image_paths, index, processed_indices, processed_alpha_paths):
+        """
+        推理完成后自动保存当前 Alpha，供一键导出使用（不依赖手动点击下载）。
+        """
+        if alpha_img is None:
+            return None, processed_indices, processed_alpha_paths, build_gallery_items(image_paths, index, processed_indices)
+
+        # 如果已经有保存过的同一张图的 alpha，就不重复保存
+        processed_indices = processed_indices or []
+        processed_alpha_paths = processed_alpha_paths or []
+        if index in processed_indices:
+            return None, processed_indices, processed_alpha_paths, build_gallery_items(image_paths, index, processed_indices)
+
+        # 决定保存文件名
+        if image_paths and 0 <= index < len(image_paths):
+            base = os.path.splitext(os.path.basename(image_paths[index]))[0]
+            filename = f"{base}_alpha.png"
+        else:
+            filename = f"alpha_{int(time.time())}.png"
+
+        save_dir = "outputs"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, filename)
+        alpha_img.save(save_path)
+
+        processed_indices = processed_indices + [index]
+        processed_alpha_paths = processed_alpha_paths + [save_path]
+        gallery_items = build_gallery_items(image_paths, index, processed_indices)
+        return save_path, processed_indices, processed_alpha_paths, gallery_items
+
+    def mark_processed(image_paths, index, processed_indices):
+        processed_indices = processed_indices or []
+        if index not in processed_indices:
+            processed_indices = processed_indices + [index]
+        gallery_items = build_gallery_items(image_paths, index, processed_indices)
+        return processed_indices, gallery_items
+
+    def export_all_zip(processed_alpha_paths):
+        if not processed_alpha_paths:
+            raise gr.Error("还没有已处理的 Alpha 结果可导出。", duration=5)
+        save_dir = "outputs"
+        os.makedirs(save_dir, exist_ok=True)
+        zip_path = os.path.join(save_dir, "all_alpha_results.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in processed_alpha_paths:
+                if os.path.isfile(p):
+                    zf.write(p, arcname=os.path.basename(p))
+        return zip_path
+
     with gr.Blocks() as demo:
 
-        with gr.Row():
-            with gr.Column(scale=45):
-                img_in = ImagePrompter(type='numpy', show_label=False, label="Input Image")
-                
-            with gr.Column(scale=45):
-                img_out = gr.Image(type='pil', label="Pred. Alpha")
+        # 全局状态：批量图片路径 & 当前索引 & 已处理索引 & 已处理alpha文件
+        image_paths_state = gr.State([])
+        current_index_state = gr.State(0)
+        processed_indices_state = gr.State([])
+        processed_alpha_paths_state = gr.State([])
 
         with gr.Row():
+            with gr.Column(scale=45):
+                # 批量导入区
+                batch_files = gr.Files(
+                    label="批量导入图片（一次性选中多张）",
+                    file_types=["image"],
+                    file_count="multiple",
+                )
+                load_batch_btn = gr.Button("载入批量图片")
+
+                # 交互式单图处理
+                img_in = ImagePrompter(
+                    type="numpy",
+                    show_label=False,
+                    label="交互式输入（点击/框选当前图片）",
+                )
+
+                with gr.Row():
+                    prev_btn = gr.Button("上一张")
+                    next_btn = gr.Button("下一张")
+
+                gallery = gr.Gallery(
+                    label="批量列表（正在处理 / 已处理 / 待处理）",
+                    show_label=True,
+                    columns=5,
+                    height="auto",
+                    allow_preview=False,
+                )
 
             with gr.Column(scale=45):
-                bt = gr.Button()
+                img_out = gr.Image(type="pil", label="Pred. Alpha", show_download_button=True)
+                if args.show_trimap:
+                    trimap_out = gr.Image(type="pil", label="Pred. Trimap", show_download_button=True)
 
-            if args.show_trimap:
-                with gr.Column(scale=45):
-                    trimap_out = gr.Image(type='pil', label="Pred. Trimap")
+                with gr.Row():
+                    bt = gr.Button("运行当前图片推理")
+                    download_btn = gr.Button("下载当前 Alpha 结果")
+                    zip_btn = gr.Button("一键导出全部已处理 Alpha (zip)")
 
+                result_file = gr.File(label="点击下载当前 Alpha 图", interactive=False)
+                zip_file = gr.File(label="全部 Alpha 打包下载", interactive=False)
+
+        # 推理绑定（保留原逻辑）
         if args.show_trimap:
-            bt.click(inference_image, inputs=[img_in], outputs=[img_out,trimap_out]) 
+            bt.click(inference_image, inputs=[img_in], outputs=[img_out, trimap_out]).then(
+                auto_save_alpha,
+                inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state],
+                outputs=[result_file, processed_indices_state, processed_alpha_paths_state, gallery],
+            )
         else:
-            bt.click(inference_image, inputs=[img_in], outputs=[img_out]) 
+            bt.click(inference_image, inputs=[img_in], outputs=[img_out]).then(
+                auto_save_alpha,
+                inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state],
+                outputs=[result_file, processed_indices_state, processed_alpha_paths_state, gallery],
+            )
+
+        # 批量导入 & 图片切换
+        load_batch_btn.click(
+            init_batch,
+            inputs=[batch_files],
+            outputs=[img_in, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state, gallery],
+        )
+        next_btn.click(
+            goto_next_image,
+            inputs=[image_paths_state, current_index_state, processed_indices_state],
+            outputs=[img_in, current_index_state, gallery],
+        )
+        prev_btn.click(
+            goto_prev_image,
+            inputs=[image_paths_state, current_index_state, processed_indices_state],
+            outputs=[img_in, current_index_state, gallery],
+        )
+
+        # 结果下载（基于当前 img_out + 当前图片名）
+        download_btn.click(
+            save_current_alpha,
+            inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state],
+            outputs=[result_file, processed_indices_state, processed_alpha_paths_state, gallery],
+        )
+
+        # 全部 Alpha 打包导出
+        zip_btn.click(
+            export_all_zip,
+            inputs=[processed_alpha_paths_state],
+            outputs=[zip_file],
+        )
 
     demo.launch()

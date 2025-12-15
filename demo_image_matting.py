@@ -352,7 +352,7 @@ def parse_args():
 
     parser.add_argument('--box-aug', default=False, type=bool)
 
-    parser.add_argument('--show-trimap', default=True, type=bool)
+    parser.add_argument('--show-trimap', default=False, type=bool)
 
 
     return parser.parse_args()

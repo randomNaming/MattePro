@@ -8,6 +8,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision
+import os
+from PIL import Image
+import zipfile
+import tempfile
 
 
 
@@ -373,28 +377,180 @@ if __name__ == '__main__':
         else:
             return alpha
 
+    def inference_single_image(img_array, use_full_image_bbox=False):
+        """
+        处理单张图片（用于批量处理）
+        img_array: numpy array格式的图片
+        use_full_image_bbox: 是否使用整张图片作为bbox
+        """
+        if img_array is None:
+            return None, None
+        
+        # 如果没有提供prompts，使用整张图片作为bbox
+        if use_full_image_bbox:
+            H, W = img_array.shape[:2]
+            # 创建一个包含整张图片的bbox，稍微缩小一点避免边界问题
+            margin = 10
+            bbox = [[margin, margin, 2, W - margin, H - margin, 3]]
+            click = []
+        else:
+            # 使用默认的bbox（整张图片）
+            H, W = img_array.shape[:2]
+            margin = 10
+            bbox = [[margin, margin, 2, W - margin, H - margin, 3]]
+            click = []
+        
+        prompts = {
+            "image": img_array,
+            "points": bbox + [[click[0], click[1], click[2]] for click in click] if click else bbox
+        }
+        
+        image, click, bbox, ori_H_W, pad_H_W = resize_image_bbox(prompts, args.box_aug)
+        
+        input_data = {
+            'image': torch.from_numpy(image)[None].to(model.device),
+            'bbox': torch.from_numpy(bbox)[None].to(model.device),
+            'click': torch.from_numpy(click)[None].to(model.device),
+        }
+
+        with torch.no_grad():
+            inputs = preprocess_inputs(input_data, device) 
+            images, bbox, gt_alpha, trimap, condition = inputs['images'], inputs['bbox'], inputs['alpha'], inputs['trimap'], inputs['condition']
+            click = inputs['click']
+            
+            if model.backbone_condition:
+                condition_proj = model.condition_embedding(condition) 
+            elif model.backbone_bbox_prompt is not None or model.bbox_prompt_all_block is not None:
+                condition_proj = bbox
+            else:
+                condition_proj = None
+
+            prompt = (click, bbox)
+
+            pred = model.forward((images, prompt))
+            pred = F.interpolate(pred, size=img_array.shape[0:2], mode='bilinear', align_corners=False)
+            trimap = torch.clip(torch.argmax(pred, dim=1) * 128, min=0, max=255)[0].cpu().numpy().astype(np.uint8)
+
+            # Apply matting inference to the result
+            alpha = matting_inference(matter, img_array, trimap, device).squeeze()
+        
+        return alpha, trimap if args.show_trimap else None
+
+    def batch_process_images(image_files, progress=gr.Progress()):
+        """
+        批量处理图片
+        image_files: 图片文件列表
+        """
+        if image_files is None or len(image_files) == 0:
+            return None, "请上传至少一张图片"
+        
+        results = []
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            total = len(image_files)
+            for idx, img_file in enumerate(progress.tqdm(image_files, desc="处理中")):
+                img_name = "unknown"
+                try:
+                    # 读取图片
+                    if isinstance(img_file, str):
+                        img_array = cv2.imread(img_file)
+                        if img_array is None:
+                            continue
+                        img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+                        img_name = os.path.basename(img_file)
+                    else:
+                        # Gradio返回的文件对象
+                        img_array = np.array(Image.open(img_file.name))
+                        img_name = os.path.basename(img_file.name)
+                    
+                    # 处理图片
+                    alpha, trimap = inference_single_image(img_array, use_full_image_bbox=True)
+                    
+                    if alpha is not None:
+                        # 保存结果
+                        base_name = os.path.splitext(img_name)[0]
+                        alpha_path = os.path.join(temp_dir, f"{base_name}_alpha.png")
+                        Image.fromarray(alpha).save(alpha_path)
+                        results.append(alpha_path)
+                        
+                        if trimap is not None and args.show_trimap:
+                            trimap_path = os.path.join(temp_dir, f"{base_name}_trimap.png")
+                            Image.fromarray(trimap).save(trimap_path)
+                
+                except Exception as e:
+                    print(f"处理图片 {img_name} 时出错: {e}")
+                    continue
+            
+            if len(results) == 0:
+                return None, "处理失败，没有生成任何结果"
+            
+            # 创建ZIP文件
+            zip_path = os.path.join(temp_dir, "batch_results.zip")
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for result_path in results:
+                    zipf.write(result_path, os.path.basename(result_path))
+            
+            return zip_path, f"成功处理 {len(results)}/{total} 张图片"
+        
+        except Exception as e:
+            return None, f"批量处理出错: {str(e)}"
+
 
     with gr.Blocks() as demo:
+        gr.Markdown("# MattePro - 专业图像抠图工具")
+        gr.Markdown("支持单张图片交互式处理和批量处理两种模式")
+        
+        with gr.Tabs():
+            # 单张图片处理标签页
+            with gr.Tab("单张图片处理"):
+                with gr.Row():
+                    with gr.Column(scale=45):
+                        img_in = ImagePrompter(type='numpy', show_label=False, label="输入图片（可点击或框选）")
+                        
+                    with gr.Column(scale=45):
+                        img_out = gr.Image(type='pil', label="预测的Alpha通道")
 
-        with gr.Row():
-            with gr.Column(scale=45):
-                img_in = ImagePrompter(type='numpy', show_label=False, label="Input Image")
+                with gr.Row():
+                    with gr.Column(scale=45):
+                        bt = gr.Button("开始处理", variant="primary")
+
+                    if args.show_trimap:
+                        with gr.Column(scale=45):
+                            trimap_out = gr.Image(type='pil', label="预测的Trimap")
+
+                if args.show_trimap:
+                    bt.click(inference_image, inputs=[img_in], outputs=[img_out,trimap_out]) 
+                else:
+                    bt.click(inference_image, inputs=[img_in], outputs=[img_out])
+            
+            # 批量处理标签页
+            with gr.Tab("批量处理"):
+                gr.Markdown("### 批量处理说明")
+                gr.Markdown("""
+                - 上传多张图片进行批量处理
+                - 每张图片将自动使用整张图片作为处理区域
+                - 处理完成后会自动打包为ZIP文件供下载
+                - 支持常见图片格式：JPG, PNG, BMP等
+                """)
                 
-            with gr.Column(scale=45):
-                img_out = gr.Image(type='pil', label="Pred. Alpha")
-
-        with gr.Row():
-
-            with gr.Column(scale=45):
-                bt = gr.Button()
-
-            if args.show_trimap:
-                with gr.Column(scale=45):
-                    trimap_out = gr.Image(type='pil', label="Pred. Trimap")
-
-        if args.show_trimap:
-            bt.click(inference_image, inputs=[img_in], outputs=[img_out,trimap_out]) 
-        else:
-            bt.click(inference_image, inputs=[img_in], outputs=[img_out]) 
+                with gr.Row():
+                    with gr.Column():
+                        batch_files = gr.File(
+                            file_count="multiple",
+                            label="上传图片（可多选）",
+                            file_types=["image"]
+                        )
+                        batch_btn = gr.Button("开始批量处理", variant="primary")
+                    
+                    with gr.Column():
+                        batch_status = gr.Textbox(label="处理状态", interactive=False)
+                        batch_download = gr.File(label="下载结果（ZIP文件）")
+                
+                batch_btn.click(
+                    batch_process_images,
+                    inputs=[batch_files],
+                    outputs=[batch_download, batch_status]
+                )
 
     demo.launch()

@@ -311,9 +311,14 @@ def resize_image_bbox(prompts,box_aug):
 def load_image_as_numpy(path):
     """
     从文件路径读取图像，转换为 RGB 格式的 numpy 数组，供 ImagePrompter 使用。
+    同时返回图像的ICC配置文件信息。
     """
-    img = Image.open(path).convert("RGB")
-    return np.array(img)
+    img = Image.open(path)
+    # 提取ICC配置文件
+    icc_profile = img.info.get('icc_profile')
+    # 转换为RGB格式
+    img = img.convert("RGB")
+    return np.array(img), icc_profile
 
 
 def build_gallery_items(image_paths, current_index, processed_indices):
@@ -400,13 +405,15 @@ if __name__ == '__main__':
             # Apply matting inference to the result
             alpha = matting_inference(matter, prompts["image"], trimap, device).squeeze()
 
-
+        # Convert numpy array to PIL Image for ICC profile support
+        alpha_pil = Image.fromarray(alpha)
 
         # Return the results: alpha and trimap (if requested)
         if args.show_trimap:
-            return alpha, trimap
+            trimap_pil = Image.fromarray(trimap)
+            return alpha_pil, trimap_pil
         else:
-            return alpha
+            return alpha_pil
 
 
     # -------------------------
@@ -418,22 +425,29 @@ if __name__ == '__main__':
         根据上传的文件列表，初始化批量处理：
         - 记录所有图片路径
         - 将第一张图片显示到 ImagePrompter 上
+        - 提取并存储所有图片的ICC配置文件
         """
         if not files:
             raise gr.Error("请先选择至少一张图片进行批量处理。", duration=5)
 
         paths = [f.name for f in files]
-        first_img = load_image_as_numpy(paths[0])
+        # 提取所有图片的ICC配置文件
+        icc_profiles = []
+        for path in paths:
+            _, icc_profile = load_image_as_numpy(path)
+            icc_profiles.append(icc_profile)
+        
+        first_img, _ = load_image_as_numpy(paths[0])
         # ImagePrompter 需要 {image, points} 结构
         prompter_value = {"image": first_img, "points": []}
         gallery_items = build_gallery_items(paths, 0, [])
-        return prompter_value, paths, 0, [], [], gallery_items
+        return prompter_value, paths, 0, [], [], gallery_items, icc_profiles
 
     def goto_next_image(image_paths, index, processed_indices):
         if not image_paths:
             raise gr.Error("请先在左侧批量导入图片。", duration=5)
         index = (index + 1) % len(image_paths)
-        img = load_image_as_numpy(image_paths[index])
+        img, _ = load_image_as_numpy(image_paths[index])
         gallery_items = build_gallery_items(image_paths, index, processed_indices)
         return {"image": img, "points": []}, index, gallery_items
 
@@ -441,14 +455,23 @@ if __name__ == '__main__':
         if not image_paths:
             raise gr.Error("请先在左侧批量导入图片。", duration=5)
         index = (index - 1) % len(image_paths)
-        img = load_image_as_numpy(image_paths[index])
+        img, _ = load_image_as_numpy(image_paths[index])
         gallery_items = build_gallery_items(image_paths, index, processed_indices)
         return {"image": img, "points": []}, index, gallery_items
 
-    def save_current_alpha(alpha_img, image_paths, index, processed_indices, processed_alpha_paths):
+    def save_current_alpha(alpha_img, image_paths, index, processed_indices, processed_alpha_paths, icc_profiles=None, preserve_icc=True):
         """
         将当前预测的 alpha 图保存为文件，供一键下载。
         文件名默认沿用原图名，追加 _alpha 后缀。
+        
+        参数:
+            alpha_img: Alpha图像
+            image_paths: 图像路径列表
+            index: 当前图像索引
+            processed_indices: 已处理图像索引列表
+            processed_alpha_paths: 已处理Alpha路径列表
+            icc_profiles: ICC配置文件列表
+            preserve_icc: 是否保留ICC配置文件
         """
         if alpha_img is None:
             raise gr.Error("请先点击推理按钮生成结果，再尝试下载。", duration=5)
@@ -464,7 +487,12 @@ if __name__ == '__main__':
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, filename)
 
-        alpha_img.save(save_path)
+        # 保存时应用ICC配置文件（如果存在且用户选择保留）
+        save_kwargs = {}
+        if preserve_icc and icc_profiles and 0 <= index < len(icc_profiles) and icc_profiles[index] is not None:
+            save_kwargs['icc_profile'] = icc_profiles[index]
+        
+        alpha_img.save(save_path, **save_kwargs)
 
         processed_alpha_paths = processed_alpha_paths or []
         processed_indices = processed_indices or []
@@ -475,9 +503,18 @@ if __name__ == '__main__':
 
         return save_path, processed_indices, processed_alpha_paths, gallery_items
 
-    def auto_save_alpha(alpha_img, image_paths, index, processed_indices, processed_alpha_paths):
+    def auto_save_alpha(alpha_img, image_paths, index, processed_indices, processed_alpha_paths, icc_profiles=None, preserve_icc=True):
         """
         推理完成后自动保存当前 Alpha，供一键导出使用（不依赖手动点击下载）。
+        
+        参数:
+            alpha_img: Alpha图像
+            image_paths: 图像路径列表
+            index: 当前图像索引
+            processed_indices: 已处理图像索引列表
+            processed_alpha_paths: 已处理Alpha路径列表
+            icc_profiles: ICC配置文件列表
+            preserve_icc: 是否保留ICC配置文件
         """
         if alpha_img is None:
             return None, processed_indices, processed_alpha_paths, build_gallery_items(image_paths, index, processed_indices)
@@ -498,7 +535,13 @@ if __name__ == '__main__':
         save_dir = "outputs"
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, filename)
-        alpha_img.save(save_path)
+        
+        # 保存时应用ICC配置文件（如果存在且用户选择保留）
+        save_kwargs = {}
+        if preserve_icc and icc_profiles and 0 <= index < len(icc_profiles) and icc_profiles[index] is not None:
+            save_kwargs['icc_profile'] = icc_profiles[index]
+            
+        alpha_img.save(save_path, **save_kwargs)
 
         processed_indices = processed_indices + [index]
         processed_alpha_paths = processed_alpha_paths + [save_path]
@@ -526,11 +569,12 @@ if __name__ == '__main__':
 
     with gr.Blocks() as demo:
 
-        # 全局状态：批量图片路径 & 当前索引 & 已处理索引 & 已处理alpha文件
+        # 全局状态：批量图片路径 & 当前索引 & 已处理索引 & 已处理alpha文件 & ICC配置文件
         image_paths_state = gr.State([])
         current_index_state = gr.State(0)
         processed_indices_state = gr.State([])
         processed_alpha_paths_state = gr.State([])
+        icc_profiles_state = gr.State([])
 
         with gr.Row():
             with gr.Column(scale=45):
@@ -541,6 +585,13 @@ if __name__ == '__main__':
                     file_count="multiple",
                 )
                 load_batch_btn = gr.Button("载入批量图片")
+                
+                # ICC配置文件选项
+                preserve_icc = gr.Checkbox(
+                    label="保留ICC色彩配置文件（推荐用于专业工作流程）",
+                    value=True,
+                    info="保留原图的ICC色彩配置文件，确保输出图像色彩一致性"
+                )
 
                 # 交互式单图处理
                 img_in = ImagePrompter(
@@ -578,13 +629,13 @@ if __name__ == '__main__':
         if args.show_trimap:
             bt.click(inference_image, inputs=[img_in], outputs=[img_out, trimap_out]).then(
                 auto_save_alpha,
-                inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state],
+                inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state, icc_profiles_state, preserve_icc],
                 outputs=[result_file, processed_indices_state, processed_alpha_paths_state, gallery],
             )
         else:
             bt.click(inference_image, inputs=[img_in], outputs=[img_out]).then(
                 auto_save_alpha,
-                inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state],
+                inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state, icc_profiles_state, preserve_icc],
                 outputs=[result_file, processed_indices_state, processed_alpha_paths_state, gallery],
             )
 
@@ -592,7 +643,7 @@ if __name__ == '__main__':
         load_batch_btn.click(
             init_batch,
             inputs=[batch_files],
-            outputs=[img_in, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state, gallery],
+            outputs=[img_in, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state, gallery, icc_profiles_state],
         )
         next_btn.click(
             goto_next_image,
@@ -608,7 +659,7 @@ if __name__ == '__main__':
         # 结果下载（基于当前 img_out + 当前图片名）
         download_btn.click(
             save_current_alpha,
-            inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state],
+            inputs=[img_out, image_paths_state, current_index_state, processed_indices_state, processed_alpha_paths_state, icc_profiles_state, preserve_icc],
             outputs=[result_file, processed_indices_state, processed_alpha_paths_state, gallery],
         )
 

@@ -451,17 +451,19 @@ if __name__ == '__main__':
             total = len(image_files)
             for idx, img_file in enumerate(progress.tqdm(image_files, desc="处理中")):
                 img_name = "unknown"
+                icc_profile = None
                 try:
                     # 读取图片
                     if isinstance(img_file, str):
-                        img_array = cv2.imread(img_file)
-                        if img_array is None:
-                            continue
-                        img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+                        src_img = Image.open(img_file)
+                        icc_profile = src_img.info.get("icc_profile")
+                        img_array = np.array(src_img.convert("RGB"))
                         img_name = os.path.basename(img_file)
                     else:
                         # Gradio返回的文件对象
-                        img_array = np.array(Image.open(img_file.name))
+                        src_img = Image.open(img_file.name)
+                        icc_profile = src_img.info.get("icc_profile")
+                        img_array = np.array(src_img.convert("RGB"))
                         img_name = os.path.basename(img_file.name)
                     
                     # 处理图片
@@ -471,12 +473,13 @@ if __name__ == '__main__':
                         # 保存结果
                         base_name = os.path.splitext(img_name)[0]
                         alpha_path = os.path.join(temp_dir, f"{base_name}_alpha.png")
-                        Image.fromarray(alpha).save(alpha_path)
+                        save_args = {"icc_profile": icc_profile} if icc_profile else {}
+                        Image.fromarray(alpha).save(alpha_path, **save_args)
                         results.append(alpha_path)
                         
                         if trimap is not None and args.show_trimap:
                             trimap_path = os.path.join(temp_dir, f"{base_name}_trimap.png")
-                            Image.fromarray(trimap).save(trimap_path)
+                            Image.fromarray(trimap).save(trimap_path, **save_args)
                 
                 except Exception as e:
                     print(f"处理图片 {img_name} 时出错: {e}")
@@ -509,7 +512,8 @@ if __name__ == '__main__':
                         img_in = ImagePrompter(type='numpy', show_label=False, label="输入图片（可点击或框选）")
                         
                     with gr.Column(scale=45):
-                        img_out = gr.Image(type='pil', label="预测的Alpha通道")
+                        # 强制使用 JPEG 作为下载格式，避免浏览器另存为 WebP
+                        img_out = gr.Image(type='pil', label="预测的Alpha通道", format="jpeg")
 
                 with gr.Row():
                     with gr.Column(scale=45):
@@ -517,7 +521,7 @@ if __name__ == '__main__':
 
                     if args.show_trimap:
                         with gr.Column(scale=45):
-                            trimap_out = gr.Image(type='pil', label="预测的Trimap")
+                            trimap_out = gr.Image(type='pil', label="预测的Trimap", format="jpeg")
 
                 if args.show_trimap:
                     bt.click(inference_image, inputs=[img_in], outputs=[img_out,trimap_out]) 
